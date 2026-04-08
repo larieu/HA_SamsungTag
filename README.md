@@ -23,7 +23,7 @@ The script performs the following:
 ```yaml
 command_line:
   - sensor:
-      name: "SmartTag2 Ana Battery"
+      name: "SmartTag2 YourPrefferedName Battery"
       command: "python3 /config/scripts/smarttag/tag_battery.py"
       scan_interval: 3600
       value_template: "{{ value }}"
