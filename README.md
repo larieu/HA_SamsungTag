@@ -14,7 +14,7 @@ The sensor is polled every 6 hours via HA's `command_line` integration.
 
 - Home Assistant OS (hassio) running as a VM (e.g. Proxmox)
 - SSH access to the HA host (e.g. via the **Advanced SSH & Web Terminal** add-on)
-- A Linux computer/desktop with a browser (for the one-time SmartThings login)
+- A Linux computer with a browser (for the one-time SmartThings login)
 - `npm` installed on your computer
 - Your SmartTag2 already paired in the SmartThings app
 
@@ -38,13 +38,13 @@ smartthings devices
 
 A browser window will open asking you to log in to Samsung. After login, the CLI saves credentials automatically. Confirm it works — you should see your devices listed including your SmartTag2.
 
-### 1.3 Find the credentials file
+### 1.3 Find the credentials file and your Device ID
 
 ```bash
 cat /home/$USER/.local/share/@smartthings/cli/credentials.json
 ```
 
-Note your **Device ID** for the SmartTag2 from the device list (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+Also note the **Device ID** of your SmartTag2 from the device list — it looks like `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. You will need it in Part 6.
 
 ---
 
@@ -54,6 +54,7 @@ SSH into your HA instance and create the required directories:
 
 ```bash
 mkdir -p /config/scripts/smarttag/.smartthings
+mkdir -p /config/scripts/smarttag/bin
 ```
 
 ---
@@ -80,19 +81,16 @@ tar -xJf node.tar.xz
 
 ## Part 4 — Install the SmartThings CLI on HA
 
-Still in `/config/scripts/smarttag/bin`:
+Still in `/config/scripts/smarttag/bin`, add node to PATH for this session and install the CLI locally:
 
 ```bash
-# Add node to PATH for this session
 export PATH="/config/scripts/smarttag/bin/node-v20.11.0-linux-x64-musl/bin:$PATH"
-
-# Install the SmartThings CLI locally
 npm install @smartthings/cli
 ```
 
-### 4.1 Create the wrapper script
+> Note: the `export PATH=...` above is session-only. The wrapper script below makes the correct Node binary available for every CLI invocation permanently.
 
-This wrapper ensures the correct Node binary is always used and prevents stale tokens from leaking in via environment variables:
+### 4.1 Create the wrapper script
 
 ```bash
 cat << 'EOF' > /config/scripts/smarttag/bin/smartthings
@@ -137,13 +135,16 @@ scp /home/$USER/.local/share/@smartthings/cli/credentials.json \
 /config/scripts/smarttag/bin/smartthings devices
 ```
 
-You should see your SmartTag2 listed. If you get a 401 error, check that no `SMARTTHINGS_TOKEN` environment variable is set (`echo $SMARTTHINGS_TOKEN`) and that the wrapper script does not contain a hardcoded token.
+You should see your SmartTag2 listed.
 
 ---
 
 ## Part 6 — The Python script
 
-This script calls the SmartThings API directly — no CLI at runtime. It handles token refresh automatically when the access token expires.
+This script calls the SmartThings API directly using Python's standard library — no CLI, no Node.js at runtime. It handles token refresh automatically when the access token expires, writing the new tokens back to `credentials.json`.
+
+> **Why not call the CLI from Python?**  
+> The SmartThings CLI requires an interactive TTY and will hang indefinitely when spawned as a subprocess from HA's `command_line` integration, which runs in a headless environment. The direct API approach avoids this entirely.
 
 Create `/config/scripts/smarttag/tag_battery.py`:
 
@@ -168,6 +169,9 @@ def save_credentials(creds):
 
 def refresh_token(creds):
     url = "https://auth-global.api.smartthings.com/oauth/token"
+    # client_id is the SmartThings CLI's public OAuth client ID.
+    # If refresh ever stops working, verify it at:
+    # https://github.com/SmartThingsCommunity/smartthings-cli
     payload = urllib.parse.urlencode({
         "grant_type": "refresh_token",
         "refresh_token": creds["refreshToken"],
@@ -212,21 +216,23 @@ Make it executable:
 chmod +x /config/scripts/smarttag/tag_battery.py
 ```
 
-Test it:
+### 6.1 Test the script
 
 ```bash
 python3 /config/scripts/smarttag/tag_battery.py
 # Expected output: FULL, NORMAL, or LOW
 ```
 
-Also test simulating HA's minimal environment:
+Also verify it works in a minimal environment that simulates how HA runs it:
 
 ```bash
 env -i HOME=/hassio \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   python3 /config/scripts/smarttag/tag_battery.py
-# Should also return FULL, NORMAL, or LOW — not an error
+# Should return FULL, NORMAL, or LOW — not an error or timeout
 ```
+
+Both should return the same result instantly.
 
 ---
 
@@ -253,7 +259,7 @@ command_line:
 
 Restart HA or reload the configuration. The sensor will appear as `sensor.smarttag2_tag1_battery`.
 
-To force an immediate update without waiting 6 hours:
+To force an immediate update without waiting 6 hours:  
 **Developer Tools → Actions → `homeassistant.update_entity`** → enter `sensor.smarttag2_tag1_battery`.
 
 ---
@@ -263,15 +269,15 @@ To force an immediate update without waiting 6 hours:
 ```
 /config/scripts/smarttag/
 ├── .smartthings/
-│   └── credentials.json          # OAuth credentials (copied from computer)
+│   └── credentials.json                  # OAuth credentials (copied from computer)
 ├── bin/
-│   ├── node-v20.11.0-linux-x64-musl/   # Node.js musl build
-│   ├── node_modules/             # SmartThings CLI npm package
-│   ├── node.tar.xz               # (can be deleted after extraction)
+│   ├── node-v20.11.0-linux-x64-musl/    # Node.js musl build
+│   ├── node_modules/                     # SmartThings CLI npm package
+│   ├── node.tar.xz                       # (can be deleted after extraction)
 │   ├── package.json
 │   ├── package-lock.json
-│   └── smartthings               # Wrapper shell script
-└── tag_battery.py                # The HA sensor script
+│   └── smartthings                       # Wrapper shell script
+└── tag_battery.py                        # The HA sensor script
 ```
 
 ---
@@ -279,31 +285,25 @@ To force an immediate update without waiting 6 hours:
 ## Troubleshooting
 
 ### 401 Unauthorized
-The access token has expired and automatic refresh failed. Re-authenticate on your computer and copy the credentials file again:
+The access token has expired and automatic refresh failed. Re-run the CLI on your computer to get a fresh token, then copy the credentials file to HA again:
+
 ```bash
-smartthings devices   # triggers refresh on computer
+# On your computer
+smartthings devices
+
 scp /home/$USER/.local/share/@smartthings/cli/credentials.json \
     root@<HA_IP>:/config/scripts/smarttag/.smartthings/credentials.json
 ```
 
 ### Sensor shows UNKNOWN
-The script returned an empty or unexpected value. Run the script manually from the HA SSH terminal and check the output:
+The script returned an empty or unexpected value. Run it manually from the HA SSH terminal to see the actual output:
+
 ```bash
 python3 /config/scripts/smarttag/tag_battery.py
 ```
 
-### Sensor shows the error message instead of battery level
-During development the script returns `str(e)` for debugging. Once working, change the last `except` line to `return "ERROR"`.
-
-### CLI hangs / timeout
-Do not call the CLI from the Python script — use the direct API approach in Part 6. The CLI requires an interactive TTY and will hang when called from HA's `command_line` integration.
-
-### SMARTTHINGS_TOKEN conflict
-If you previously set `SMARTTHINGS_TOKEN` in your shell or in the wrapper script, it will override the credentials file. The wrapper script must contain `unset SMARTTHINGS_TOKEN`. Check with:
-```bash
-cat /config/scripts/smarttag/bin/smartthings
-grep -r "SMARTTHINGS_TOKEN" /root/.zshrc /root/.bashrc /root/.profile 2>/dev/null
-```
+### Sensor shows an error message instead of FULL / NORMAL / LOW
+The script returns `str(e)` so you can read the error directly in the HA UI during initial setup. Once everything is working you can change the last `except` line to `return "ERROR"` if you prefer a clean fallback.
 
 ---
 
@@ -312,5 +312,5 @@ grep -r "SMARTTHINGS_TOKEN" /root/.zshrc /root/.bashrc /root/.profile 2>/dev/nul
 - The OAuth **access token** expires roughly every 24 hours
 - The **refresh token** stays valid as long as it is used regularly
 - The Python script refreshes automatically on 401 — no manual intervention needed
-- If HA polls every 6 hours, the refresh token will never go stale
-- If you revoke app access in Samsung account settings, you will need to re-authenticate from scratch on your computer
+- With HA polling every 6 hours, the refresh token will never go stale
+- If you revoke app access in Samsung account settings, you will need to re-authenticate from scratch on your computer (Part 1) and repeat Part 5
