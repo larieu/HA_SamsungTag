@@ -14,15 +14,15 @@ The sensor is polled every 6 hours via HA's `command_line` integration.
 
 - Home Assistant OS (hassio) running as a VM (e.g. Proxmox)
 - SSH access to the HA host (e.g. via the **Advanced SSH & Web Terminal** add-on)
-- A Linux laptop/desktop with a browser (for the one-time SmartThings login)
-- `npm` installed on your laptop
+- A Linux computer/desktop with a browser (for the one-time SmartThings login)
+- `npm` installed on your computer
 - Your SmartTag2 already paired in the SmartThings app
 
 ---
 
-## Part 1 — Authenticate on your laptop (one-time)
+## Part 1 — Authenticate on your computer (one-time)
 
-The SmartThings CLI requires a browser for its OAuth flow. Do this once on your laptop.
+The SmartThings CLI requires a browser for its OAuth flow. Do this once on your computer.
 
 ### 1.1 Install the SmartThings CLI
 
@@ -113,9 +113,9 @@ chmod +x /config/scripts/smarttag/bin/smartthings
 
 ---
 
-## Part 5 — Copy credentials from your laptop to HA
+## Part 5 — Copy credentials from your computer to HA
 
-On your **laptop**, copy the credentials file to HA via scp:
+On your **computer**, copy the credentials file to HA via scp:
 
 ```bash
 scp /home/$USER/.local/share/@smartthings/cli/credentials.json \
