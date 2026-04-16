@@ -4,9 +4,18 @@ Monitor your Samsung SmartTag2 battery level in Home Assistant using the SmartTh
 
 ## How it works
 
-A Python script reads the battery level directly from the SmartThings REST API using OAuth credentials obtained from the SmartThings CLI. The script handles token refresh automatically — no browser, no CLI at runtime.
+A Python script authenticates with the SmartThings API using your own OAuth app credentials. On every run it refreshes the access token automatically and saves the new tokens back to disk — so it never expires and never needs manual intervention.
 
-The sensor is polled every 6 hours via HA's `command_line` integration.
+The sensor is polled every hour via HA's `command_line` integration.
+
+---
+
+## Why this approach
+
+- The official SmartThings HA integration does not expose Tag2 battery data
+- SmartThings Personal Access Tokens (PATs) expire after 24 hours by design
+- The SmartThings CLI hangs in headless environments (no TTY) and its shared OAuth client ID is not reliable for long-running integrations
+- A registered OAuth app gives you your own `client_id` and `client_secret`, with refresh tokens that rotate on every use and never expire as long as they are used regularly
 
 ---
 
@@ -14,240 +23,188 @@ The sensor is polled every 6 hours via HA's `command_line` integration.
 
 - Home Assistant OS (hassio) running as a VM (e.g. Proxmox)
 - SSH access to the HA host (e.g. via the **Advanced SSH & Web Terminal** add-on)
-- A Linux computer with a browser (for the one-time SmartThings login)
-- `npm` installed on your computer
+- A computer with a browser and the SmartThings CLI installed (for the one-time app setup)
 - Your SmartTag2 already paired in the SmartThings app
 
----
-
-## Part 1 — Authenticate on your computer (one-time)
-
-The SmartThings CLI requires a browser for its OAuth flow. Do this once on your computer.
-
-### 1.1 Install the SmartThings CLI
+### Install the SmartThings CLI on your computer (if not already done)
 
 ```bash
 sudo npm install -g @smartthings/cli
 ```
 
-### 1.2 Authenticate
+---
+
+## Part 1 — Create your OAuth app (one-time, on your computer)
+
+### 1.1 Create the app
+
+```bash
+smartthings apps:create
+```
+
+Answer the prompts as follows:
+
+- **App type**: OAuth-In App
+- **Display Name**: HA SmartTag Bridge (or any name you prefer)
+- **Description**: anything
+- **Icon URL**: leave blank
+- **Target URL**: leave blank
+- **Scopes**: select `r:devices:*`, `w:devices:*`, `x:devices:*`, `r:locations:*`, `w:locations:*`, `x:locations:*`
+- **Redirect URI**: `https://httpbin.org/get`
+
+At the end you will see:
+
+```
+OAuth Client Id      xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+OAuth Client Secret  xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+**Save these immediately** — the secret is shown only once.
+
+### 1.2 Authorize the app and get your first tokens
+
+Open this URL in your browser (replace `YOUR_CLIENT_ID`):
+
+```
+https://api.smartthings.com/oauth/authorize?client_id=YOUR_CLIENT_ID&response_type=code&redirect_uri=https://httpbin.org/get&scope=r:devices:*%20x:devices:*%20r:locations:*%20x:locations:*
+```
+
+Log in with your Samsung account and authorize the app. You will be redirected to a page that shows the request parameters as JSON. Find the `code` value — it looks like `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+
+### 1.3 Exchange the code for tokens
+
+Run this on your computer (replace the placeholders):
+
+```bash
+curl -s -u "YOUR_CLIENT_ID:YOUR_CLIENT_SECRET" \
+  -X POST https://api.smartthings.com/oauth/token \
+  -d "grant_type=authorization_code&code=YOUR_CODE&redirect_uri=https://httpbin.org/get"
+```
+
+You will receive a JSON response containing `access_token` and `refresh_token`. Save both.
+
+### 1.4 Find your SmartTag2 Device ID
 
 ```bash
 smartthings devices
 ```
 
-A browser window will open asking you to log in to Samsung. After login, the CLI saves credentials automatically. Confirm it works — you should see your devices listed including your SmartTag2.
-
-### 1.3 Find the credentials file and your Device ID
-
-```bash
-cat /home/$USER/.local/share/@smartthings/cli/credentials.json
-```
-
-Also note the **Device ID** of your SmartTag2 from the device list — it looks like `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. You will need it in Part 6.
+Note the **Device Id** of your SmartTag2 — format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
 
 ---
 
-## Part 2 — Set up the folder structure on HA
+## Part 2 — Set up files on HA
 
-SSH into your HA instance and create the required directories:
+SSH into your HA instance.
+
+### 2.1 Create the folder
 
 ```bash
-mkdir -p /config/scripts/smarttag/.smartthings
-mkdir -p /config/scripts/smarttag/bin
+mkdir -p /config/scripts/smarttag
 ```
 
----
-
-## Part 3 — Install Node.js on HA
-
-HA OS uses musl libc (Alpine-based), so you need the musl build of Node.js. The standard glibc builds will not work.
+### 2.2 Create the tokens file
 
 ```bash
-cd /config/scripts/smarttag/bin
-
-# Download musl build of Node.js v20
-curl -L -o node.tar.xz \
-  https://unofficial-builds.nodejs.org/download/release/v20.11.0/node-v20.11.0-linux-x64-musl.tar.xz
-
-# Extract
-tar -xJf node.tar.xz
-
-# Verify
-./node-v20.11.0-linux-x64-musl/bin/node --version
-```
-
----
-
-## Part 4 — Install the SmartThings CLI on HA
-
-Still in `/config/scripts/smarttag/bin`, add node to PATH for this session and install the CLI locally:
-
-```bash
-export PATH="/config/scripts/smarttag/bin/node-v20.11.0-linux-x64-musl/bin:$PATH"
-npm install @smartthings/cli
-```
-
-> Note: the `export PATH=...` above is session-only. The wrapper script below makes the correct Node binary available for every CLI invocation permanently.
-
-### 4.1 Create the wrapper script
-
-```bash
-cat << 'EOF' > /config/scripts/smarttag/bin/smartthings
-#!/bin/bash
-export PATH="/config/scripts/smarttag/bin/node-v20.11.0-linux-x64-musl/bin:$PATH"
-unset SMARTTHINGS_TOKEN
-/config/scripts/smarttag/bin/node_modules/.bin/smartthings "$@"
+cat << 'EOF' > /config/scripts/smarttag/tokens.json
+{
+  "access_token": "PASTE_YOUR_ACCESS_TOKEN_HERE",
+  "refresh_token": "PASTE_YOUR_REFRESH_TOKEN_HERE"
+}
 EOF
-
-chmod +x /config/scripts/smarttag/bin/smartthings
 ```
 
-### 4.2 Verify the CLI works
+### 2.3 Create the Python script
 
-```bash
-/config/scripts/smarttag/bin/smartthings --version
-```
-
----
-
-## Part 5 — Copy credentials from your computer to HA
-
-On your **computer**, copy the credentials file to HA via scp:
-
-```bash
-scp /home/$USER/.local/share/@smartthings/cli/credentials.json \
-    root@<HA_IP>:/config/scripts/smarttag/.smartthings/credentials.json
-```
-
-Also copy to the system location the CLI uses as fallback:
-
-```bash
-ssh root@<HA_IP> "mkdir -p /root/.local/share/@smartthings/cli"
-
-scp /home/$USER/.local/share/@smartthings/cli/credentials.json \
-    root@<HA_IP>:/root/.local/share/@smartthings/cli/credentials.json
-```
-
-### 5.1 Verify on HA
-
-```bash
-/config/scripts/smarttag/bin/smartthings devices
-```
-
-You should see your SmartTag2 listed.
-
----
-
-## Part 6 — The Python script
-
-This script calls the SmartThings API directly using Python's standard library — no CLI, no Node.js at runtime. It handles token refresh automatically when the access token expires, writing the new tokens back to `credentials.json`.
-
-> **Why not call the CLI from Python?**  
-> The SmartThings CLI requires an interactive TTY and will hang indefinitely when spawned as a subprocess from HA's `command_line` integration, which runs in a headless environment. The direct API approach avoids this entirely.
-
-Create `/config/scripts/smarttag/tag_battery.py`:
+Create `/config/scripts/smarttag/refresh_tag.py`:
 
 ```python
 import json
-import urllib.request
-import urllib.parse
-import urllib.error
+import subprocess
+import os
 
-CREDENTIALS_FILE = "/config/scripts/smarttag/.smartthings/credentials.json"
-DEVICE_ID = "your-device-id-here"  # Replace with your SmartTag2 device ID
+CLIENT_ID     = "your-client-id-here"
+CLIENT_SECRET = "your-client-secret-here"
+DEVICE_ID     = "your-device-id-here"
+TOKEN_FILE    = "/config/scripts/smarttag/tokens.json"
 
-def load_credentials():
-    with open(CREDENTIALS_FILE) as f:
-        data = json.load(f)
-    return data["default:api.smartthings.com"]
+def run_curl(cmd):
+    return subprocess.check_output(cmd, shell=True).decode("utf-8")
 
-def save_credentials(creds):
-    data = {"default:api.smartthings.com": creds}
-    with open(CREDENTIALS_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+with open(TOKEN_FILE, "r") as f:
+    tokens = json.load(f)
 
-def refresh_token(creds):
-    url = "https://auth-global.api.smartthings.com/oauth/token"
-    # client_id is the SmartThings CLI's public OAuth client ID.
-    # If refresh ever stops working, verify it at:
-    # https://github.com/SmartThingsCommunity/smartthings-cli
-    payload = urllib.parse.urlencode({
-        "grant_type": "refresh_token",
-        "refresh_token": creds["refreshToken"],
-        "client_id": "727cbe60-5a9b-4b8b-b977-8b2f50e97f6e"
-    }).encode()
-    req = urllib.request.Request(url, data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+# Step 1 — Refresh the access token
+refresh_cmd = (
+    f"curl -s -u '{CLIENT_ID}:{CLIENT_SECRET}' "
+    f"-X POST https://api.smartthings.com/oauth/token "
+    f"-d 'grant_type=refresh_token&refresh_token={tokens['refresh_token']}'"
+)
+try:
+    resp = json.loads(run_curl(refresh_cmd))
+    if "access_token" in resp:
+        tokens["access_token"]  = resp["access_token"]
+        tokens["refresh_token"] = resp["refresh_token"]
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(tokens, f)
+except Exception:
+    pass
 
-def get_battery(access_token):
-    url = f"https://api.smartthings.com/v1/devices/{DEVICE_ID}"
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {access_token}")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-    return data["bleD2D"]["metadata"]["battery"]["level"].upper()
+# Step 2 — Get device data
+detail_cmd = (
+    f"curl -s -H 'Authorization: Bearer {tokens['access_token']}' "
+    f"https://api.smartthings.com/v1/devices/{DEVICE_ID}"
+)
+data = json.loads(run_curl(detail_cmd))
 
-def get_tag_battery():
+# Step 3 — Extract battery level
+val = None
+try:
+    val = data["bleD2D"]["metadata"]["battery"]["level"]
+except KeyError:
     try:
-        creds = load_credentials()
-        try:
-            return get_battery(creds["accessToken"])
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                new_tokens = refresh_token(creds)
-                creds["accessToken"] = new_tokens["access_token"]
-                creds["refreshToken"] = new_tokens["refresh_token"]
-                save_credentials(creds)
-                return get_battery(creds["accessToken"])
-            raise
-    except Exception as e:
-        return str(e)
+        status_cmd = (
+            f"curl -s -H 'Authorization: Bearer {tokens['access_token']}' "
+            f"https://api.smartthings.com/v1/devices/{DEVICE_ID}/status"
+        )
+        status_data = json.loads(run_curl(status_cmd))
+        val = status_data["components"]["main"]["battery"]["battery"]["value"]
+    except Exception:
+        val = "UNKNOWN"
 
-if __name__ == "__main__":
-    print(get_tag_battery())
+print(val if val is not None else "UNKNOWN")
 ```
 
-Make it executable:
+### 2.4 Test the script
 
 ```bash
-chmod +x /config/scripts/smarttag/tag_battery.py
-```
-
-### 6.1 Test the script
-
-```bash
-python3 /config/scripts/smarttag/tag_battery.py
+python3 /config/scripts/smarttag/refresh_tag.py
 # Expected output: FULL, NORMAL, or LOW
 ```
 
-Also verify it works in a minimal environment that simulates how HA runs it:
+Also confirm the tokens are being rotated — run the script twice and check that `access_token` changes:
 
 ```bash
-env -i HOME=/hassio \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  python3 /config/scripts/smarttag/tag_battery.py
-# Should return FULL, NORMAL, or LOW — not an error or timeout
+cat /config/scripts/smarttag/tokens.json
+python3 /config/scripts/smarttag/refresh_tag.py
+cat /config/scripts/smarttag/tokens.json
+# The access_token and refresh_token values should be different after the second cat
 ```
-
-Both should return the same result instantly.
 
 ---
 
-## Part 7 — Home Assistant configuration
+## Part 3 — Home Assistant configuration
 
-Add the following to `/config/configuration.yaml`:
+Add to `/config/configuration.yaml`:
 
 ```yaml
 command_line:
   - sensor:
-      name: "SmartTag2 TAG1 Battery"
-      unique_id: smarttag2_tag1_bat
-      command: "python3 /config/scripts/smarttag/tag_battery.py"
-      scan_interval: 21600
-      command_timeout: 60
+      name: "SmartTag2 Tag01 Battery"
+      unique_id: "smarttag2_tag01_battery"
+      command: "python3 /config/scripts/smarttag/refresh_tag.py"
+      scan_interval: 3600
+      command_timeout: 30
       value_template: "{{ value }}"
       icon: >
         {% if value == 'FULL' %} mdi:battery
@@ -257,10 +214,10 @@ command_line:
         {% endif %}
 ```
 
-Restart HA or reload the configuration. The sensor will appear as `sensor.smarttag2_tag1_battery`.
+Restart HA or reload the configuration. The sensor will appear as `sensor.smarttag2_tag01_battery`.
 
-To force an immediate update without waiting 6 hours:  
-**Developer Tools → Actions → `homeassistant.update_entity`** → enter `sensor.smarttag2_tag1_battery`.
+To force an immediate update:
+**Developer Tools → Actions → `homeassistant.update_entity`** → enter `sensor.smarttag2_tag01_battery`.
 
 ---
 
@@ -268,49 +225,32 @@ To force an immediate update without waiting 6 hours:
 
 ```
 /config/scripts/smarttag/
-├── .smartthings/
-│   └── credentials.json                  # OAuth credentials (copied from computer)
-├── bin/
-│   ├── node-v20.11.0-linux-x64-musl/    # Node.js musl build
-│   ├── node_modules/                     # SmartThings CLI npm package
-│   ├── node.tar.xz                       # (can be deleted after extraction)
-│   ├── package.json
-│   ├── package-lock.json
-│   └── smartthings                       # Wrapper shell script
-└── tag_battery.py                        # The HA sensor script
+├── refresh_tag.py    # The sensor script
+└── tokens.json       # OAuth tokens (auto-updated on every run)
 ```
 
 ---
 
 ## Troubleshooting
 
-### 401 Unauthorized
-The access token has expired and automatic refresh failed. Re-run the CLI on your computer to get a fresh token, then copy the credentials file to HA again:
-
+### Sensor shows UNKNOWN or an error message
+Run the script manually and check the output:
 ```bash
-# On your computer
-smartthings devices
-
-scp /home/$USER/.local/share/@smartthings/cli/credentials.json \
-    root@<HA_IP>:/config/scripts/smarttag/.smartthings/credentials.json
+python3 /config/scripts/smarttag/refresh_tag.py
 ```
 
-### Sensor shows UNKNOWN
-The script returned an empty or unexpected value. Run it manually from the HA SSH terminal to see the actual output:
+### tokens.json stops updating
+The refresh token may have been invalidated — this can happen if you revoke the app in Samsung account settings or if the token goes unused for an extended period. Repeat the authorization step from Part 1.2 to get a new code, then run the curl command from Part 1.3 to get fresh tokens and update `tokens.json` manually.
 
-```bash
-python3 /config/scripts/smarttag/tag_battery.py
-```
-
-### Sensor shows an error message instead of FULL / NORMAL / LOW
-The script returns `str(e)` so you can read the error directly in the HA UI during initial setup. Once everything is working you can change the last `except` line to `return "ERROR"` if you prefer a clean fallback.
+### Multiple tags
+For each additional tag, create a separate script file (e.g. `refresh_tag2.py`) with a different `DEVICE_ID` and a separate `tokens.json` (e.g. `tokens2.json`). Add a corresponding sensor entry in `configuration.yaml`.
 
 ---
 
 ## Token refresh notes
 
-- The OAuth **access token** expires roughly every 24 hours
-- The **refresh token** stays valid as long as it is used regularly
-- The Python script refreshes automatically on 401 — no manual intervention needed
-- With HA polling every 6 hours, the refresh token will never go stale
-- If you revoke app access in Samsung account settings, you will need to re-authenticate from scratch on your computer (Part 1) and repeat Part 5
+- The access token is refreshed on **every script run** (every hour by default)
+- Each refresh returns a new `access_token` and a new `refresh_token`, both saved back to `tokens.json`
+- The refresh token never expires as long as it is used regularly
+- Tokens are stored in `/config` which persists across HA reboots
+- No CLI, no Node.js, no browser needed after the initial setup
